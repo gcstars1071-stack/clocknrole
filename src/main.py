@@ -1,65 +1,77 @@
-name: Build WorkLog.exe
+"""
+WorkLog Tray - 시스템 트레이 앱
+- 트레이 아이콘에서 WorkLog HTML 열기
+- 백그라운드 Windows 이벤트 로그 자동 수집
+- 출퇴근 알림 (아침/저녁)
+"""
 
-on:
-  push:
-    branches: [ main ]
-    tags:     [ 'v*' ]
-  pull_request:
-    branches: [ main ]
-  workflow_dispatch:
+import sys
+import os
+import json
+import threading
+import webbrowser
+import subprocess
+import time
+import datetime
+import ctypes
 
-jobs:
-  build:
-    runs-on: windows-latest
+try:
+    import pystray
+    from PIL import Image, ImageDraw, ImageFont
+except ImportError:
+    print("pystray / Pillow not installed.")
+    sys.exit(1)
 
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+# ── 경로 설정
+if getattr(sys, 'frozen', False):
+    BASE_DIR = os.path.dirname(sys.executable)
+else:
+    BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
+HTML_PATH   = os.path.join(BASE_DIR, 'WorkLog.html')
+LOG_PATH    = os.path.join(BASE_DIR, 'worklog_winlog.json')
+CONFIG_PATH = os.path.join(BASE_DIR, 'worklog_config.json')
+PS_PATH     = os.path.join(BASE_DIR, 'WorkLog_GetWindowsLog.ps1')
 
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+# ── 설정
+DEFAULT_CONFIG = {
+    "auto_collect_interval_min": 60,
+    "collect_days_back": 30,
+    "notify_checkin_time": "09:00",
+    "notify_checkout_time": "18:00",
+    "auto_open_on_start": True,
+    "notify_enabled": True,
+}
 
-      - name: Build exe with PyInstaller
-        run: |
-          pyinstaller WorkLog.spec --clean --noconfirm
+def load_config():
+    if os.path.exists(CONFIG_PATH):
+        try:
+            with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
+                return {**DEFAULT_CONFIG, **json.load(f)}
+        except Exception:
+            pass
+    return dict(DEFAULT_CONFIG)
 
-      - name: Package release files
-        run: |
-          New-Item -ItemType Directory -Force -Path release
-          Copy-Item dist\WorkLog.exe release\
-          Copy-Item WorkLog.html release\
-          Copy-Item WorkLog_GetWindowsLog.ps1 release\
-          '{}' | Out-File release\worklog_config.json -Encoding utf8
-          Compress-Archive -Path release\* -DestinationPath WorkLog_release.zip
+def save_config(cfg):
+    with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
 
-      - name: Upload build artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: WorkLog-Windows
-          path: WorkLog_release.zip
-          retention-days: 30
+config = load_config()
 
-      - name: Create GitHub Release
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: WorkLog_release.zip
-          name: WorkLog ${{ github.ref_name }}
-          body: |
-            ## WorkLog ${{ github.ref_name }}
+# ── 아이콘 이미지 생성
+def make_icon(color=(74, 158, 255)):
+    size = 64
+    img  = Image.new('RGBA', (size, size), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    draw.ellipse([2, 2, size-2, size-2], fill=color)
+    try:
+        font = ImageFont.truetype(
+            os.path.join(os.environ.get('WINDIR','C:/Windows'), 'Fonts', 'arialbd.ttf'), 30
+        )
+    except Exception:
+        font = ImageFont.load_default()
+    draw.text((size//2, size//2), 'W', fill='white', font=font, anchor='mm')
+    return img
 
-            ### 설치 방법
-            1. `WorkLog_release.zip` 다운로드 후 압축 해제
-            2. 모든 파일을 **같은 폴더**에 위치시키기
-            3. `WorkLog.exe` 실행
-          draft: false
-          prerelease: false
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+# ── 토스트 알림
+def toast(title,
