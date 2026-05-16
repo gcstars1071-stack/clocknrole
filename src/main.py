@@ -74,4 +74,191 @@ def make_icon(color=(74, 158, 255)):
     return img
 
 # ── 토스트 알림
-def toast(title,
+def toast(title, message):
+    try:
+        from win10toast import ToastNotifier
+        ToastNotifier().show_toast(title, message, duration=4, threaded=True,
+                                   icon_path=None)
+    except Exception:
+        pass
+
+# ── Windows 로그 수집
+def collect_win_logs(days_back=None, show_toast=True):
+    if days_back is None:
+        days_back = config.get('collect_days_back', 30)
+
+    if not os.path.exists(PS_PATH):
+        if show_toast:
+            toast("WorkLog", "PowerShell 스크립트를 찾을 수 없습니다.")
+        return False
+
+    try:
+        cmd = [
+            'powershell', '-NonInteractive', '-WindowStyle', 'Hidden',
+            '-ExecutionPolicy', 'Bypass',
+            '-File', PS_PATH,
+            '-DaysBack', str(days_back),
+            '-OutputPath', LOG_PATH
+        ]
+        subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+
+        if os.path.exists(LOG_PATH):
+            with open(LOG_PATH, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            count = data.get('totalCount', 0)
+            if show_toast:
+                toast("WorkLog", f"Windows 로그 수집 완료: {count}건")
+            return True
+        else:
+            if show_toast:
+                toast("WorkLog", "로그 수집 실패 — 관리자 권한으로 실행해보세요.")
+            return False
+    except subprocess.TimeoutExpired:
+        if show_toast:
+            toast("WorkLog", "로그 수집 시간 초과")
+        return False
+    except Exception as e:
+        if show_toast:
+            toast("WorkLog", f"수집 오류: {str(e)[:60]}")
+        return False
+
+# ── 백그라운드 스레드
+stop_event = threading.Event()
+
+def auto_collect_loop():
+    while True:
+        interval = config.get('auto_collect_interval_min', 60) * 60
+        if stop_event.wait(interval):
+            break
+        collect_win_logs(show_toast=False)
+
+def reminder_loop():
+    notified = {'in': False, 'out': False}
+    last_date = None
+
+    while not stop_event.is_set():
+        if not config.get('notify_enabled', True):
+            stop_event.wait(60)
+            continue
+
+        now  = datetime.datetime.now()
+        date = now.date()
+        if date != last_date:
+            notified = {'in': False, 'out': False}
+            last_date = date
+
+        t = now.strftime('%H:%M')
+        if not notified['in'] and t == config.get('notify_checkin_time', '09:00'):
+            toast("WorkLog", "출근 시간! WorkLog에서 출근 버튼을 눌러주세요.")
+            notified['in'] = True
+        if not notified['out'] and t == config.get('notify_checkout_time', '18:00'):
+            toast("WorkLog", "퇴근 시간! 오늘 하루도 수고하셨습니다.")
+            notified['out'] = True
+
+        stop_event.wait(30)
+
+# ── 메뉴 액션
+def open_html(icon=None, item=None):
+    if os.path.exists(HTML_PATH):
+        webbrowser.open('file:///' + HTML_PATH.replace('\\', '/'))
+    else:
+        toast("WorkLog", f"WorkLog.html을 찾을 수 없습니다.\n{HTML_PATH}")
+
+def open_folder(icon=None, item=None):
+    subprocess.Popen(['explorer', BASE_DIR])
+
+def collect_now(icon=None, item=None):
+    toast("WorkLog", "Windows 로그 수집 시작...")
+    threading.Thread(target=collect_win_logs, daemon=True).start()
+
+def set_interval(mins):
+    config['auto_collect_interval_min'] = mins
+    save_config(config)
+    toast("WorkLog", f"자동 수집 간격: {mins}분으로 변경됨")
+
+def toggle_notify(icon=None, item=None):
+    config['notify_enabled'] = not config.get('notify_enabled', True)
+    save_config(config)
+    state = "켜짐" if config['notify_enabled'] else "꺼짐"
+    toast("WorkLog", f"출퇴근 알림: {state}")
+
+def quit_app(icon, item):
+    stop_event.set()
+    icon.stop()
+
+# ── 트레이 메뉴
+def build_menu():
+    return pystray.Menu(
+        pystray.MenuItem('WorkLog 열기', open_html, default=True),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem('Windows 로그 지금 수집', collect_now),
+        pystray.MenuItem('폴더 열기', open_folder),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem('자동 수집 주기', pystray.Menu(
+            pystray.MenuItem('30분마다',
+                lambda i, it: set_interval(30),
+                checked=lambda i: config.get('auto_collect_interval_min') == 30),
+            pystray.MenuItem('1시간마다',
+                lambda i, it: set_interval(60),
+                checked=lambda i: config.get('auto_collect_interval_min') == 60),
+            pystray.MenuItem('3시간마다',
+                lambda i, it: set_interval(180),
+                checked=lambda i: config.get('auto_collect_interval_min') == 180),
+            pystray.MenuItem('수집 안 함',
+                lambda i, it: set_interval(0),
+                checked=lambda i: config.get('auto_collect_interval_min') == 0),
+        )),
+        pystray.MenuItem('출퇴근 알림',
+            toggle_notify,
+            checked=lambda i: config.get('notify_enabled', True)),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem('종료', quit_app),
+    )
+
+# ── 시작프로그램 등록
+def register_startup():
+    try:
+        import winreg
+        key = winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r'Software\Microsoft\Windows\CurrentVersion\Run',
+            0, winreg.KEY_SET_VALUE
+        )
+        exe_path = sys.executable if getattr(sys, 'frozen', False) else __file__
+        winreg.SetValueEx(key, 'WorkLog', 0, winreg.REG_SZ, f'"{exe_path}"')
+        winreg.CloseKey(key)
+    except Exception:
+        pass
+
+# ── 메인
+def main():
+    try:
+        mutex = ctypes.windll.kernel32.CreateMutexW(None, False, "WorkLogTrayMutex_v1")
+        if ctypes.windll.kernel32.GetLastError() == 183:
+            open_html()
+            return
+    except Exception:
+        pass
+
+    register_startup()
+
+    threading.Thread(target=auto_collect_loop, daemon=True).start()
+    threading.Thread(target=reminder_loop,     daemon=True).start()
+    threading.Thread(
+        target=lambda: collect_win_logs(show_toast=False), daemon=True
+    ).start()
+
+    if config.get('auto_open_on_start', True):
+        open_html()
+
+    icon = pystray.Icon(
+        name='WorkLog',
+        icon=make_icon(),
+        title='WorkLog',
+        menu=build_menu()
+    )
+    toast("WorkLog", "WorkLog가 트레이에서 실행 중입니다.")
+    icon.run()
+
+if __name__ == '__main__':
+    main()
