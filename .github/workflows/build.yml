@@ -32,13 +32,12 @@ jobs:
 
       - name: Package release files
         run: |
-          mkdir release
-          copy dist\WorkLog.exe release\
-          copy WorkLog.html release\
-          copy WorkLog_GetWindowsLog.ps1 release\
-          echo {} > release\worklog_config.json
+          New-Item -ItemType Directory -Force -Path release
+          Copy-Item dist\WorkLog.exe release\
+          Copy-Item WorkLog.html release\
+          Copy-Item WorkLog_GetWindowsLog.ps1 release\
+          '{}' | Out-File release\worklog_config.json -Encoding utf8
           Compress-Archive -Path release\* -DestinationPath WorkLog_release.zip
-        shell: cmd
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
